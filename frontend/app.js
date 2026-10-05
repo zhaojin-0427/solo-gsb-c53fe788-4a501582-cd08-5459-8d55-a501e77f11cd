@@ -27,6 +27,10 @@ const S = {
   paused: null,
   messages: [],
   analysisStatus: null,
+  // 请求裁决：机构代数 + 当前机构最新请求序号 + 选支在途标志
+  gen: 0,
+  latestSeq: 0,
+  choosing: false,
   // 播放
   playing: false,
   playSeg: 0,
@@ -81,8 +85,11 @@ function isDriverEligible(l) {
   return ja && jb && ja.fixed !== jb.fixed;
 }
 
-/* 修改机构后：旧轨迹立即失效 */
+/* 修改机构后：旧轨迹立即失效，且所有在途请求（分析/选支）的回包一律作废 */
 function markDirty() {
+  S.gen++;
+  S.latestSeq = 0;
+  S.choosing = false;
   S.sessionId = null;
   S.segments = [];
   S.movingIds = [];
@@ -431,6 +438,7 @@ function renderResults() {
       const b = document.createElement('button');
       b.className = 'cand-btn';
       b.textContent = `选择候选 ${i + 1}（θ=${c.theta.toFixed(2)}°）`;
+      b.disabled = S.choosing;
       b.onclick = () => chooseCandidate(i);
       ce.appendChild(b);
     });
@@ -457,9 +465,19 @@ function buildPayload() {
   };
 }
 
+/* 请求裁决：仅当机构未变更且该请求仍是最新发起的操作时，回包才有效。
+ * 机构变更（markDirty）使代数递增；同机构每次发起分析/选支使序号递增。 */
+function isCurrent(gen, seq) {
+  return S.gen === gen && S.latestSeq === seq;
+}
+
 async function analyze() {
   if (S.driverLinkId == null) { setStatus('请先在连杆表中选择驱动杆。', true); return; }
+  const myGen = S.gen;
+  const mySeq = ++S.latestSeq;   // 新分析取代在途的旧分析/选支
+  S.choosing = false;
   setStatus('分析中…');
+  renderResults();               // 恢复可能被选支禁用的候选按钮
   let data;
   try {
     const res = await fetch('/api/analyze', {
@@ -469,14 +487,16 @@ async function analyze() {
     });
     data = await res.json();
     if (!res.ok) {
-      setStatus('分析被拒绝：' + ((data.detail && data.detail.message) || res.status), true);
+      if (isCurrent(myGen, mySeq)) {
+        setStatus('分析被拒绝：' + ((data.detail && data.detail.message) || res.status), true);
+      }
       return;
     }
   } catch (err) {
-    setStatus('网络错误：' + err.message, true);
+    if (isCurrent(myGen, mySeq)) setStatus('网络错误：' + err.message, true);
     return;
   }
-  applyResult(data);
+  if (isCurrent(myGen, mySeq)) applyResult(data);
 }
 
 function applyResult(data) {
@@ -497,24 +517,37 @@ function applyResult(data) {
 }
 
 async function chooseCandidate(i) {
-  if (S.sessionId == null) return;
+  if (S.sessionId == null || S.choosing) return;  // 选支未完成时不得重复提交
+  const myGen = S.gen;
+  const mySeq = ++S.latestSeq;
+  const sid = S.sessionId;
+  S.choosing = true;
+  setStatus('选支续算中…');
+  renderResults();               // 禁用全部候选按钮
   let data;
   try {
-    const res = await fetch(`/api/sessions/${S.sessionId}/choose`, {
+    const res = await fetch(`/api/sessions/${sid}/choose`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ candidate_index: i }),
     });
     data = await res.json();
     if (!res.ok) {
-      setStatus('选支失败：' + ((data.detail && data.detail.message) || data.detail || res.status), true);
+      if (isCurrent(myGen, mySeq)) {
+        setStatus('选支失败：' + ((data.detail && data.detail.message) || data.detail || res.status), true);
+      }
       return;
     }
   } catch (err) {
-    setStatus('网络错误：' + err.message, true);
+    if (isCurrent(myGen, mySeq)) setStatus('网络错误：' + err.message, true);
     return;
+  } finally {
+    if (isCurrent(myGen, mySeq)) {
+      S.choosing = false;
+      renderResults();           // 恢复候选按钮（无论成功失败）
+    }
   }
-  applyResult(data);
+  if (isCurrent(myGen, mySeq)) applyResult(data);
 }
 
 /* ---------------- 播放 ---------------- */
